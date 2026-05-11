@@ -1,0 +1,16 @@
+# Generic traffic profile - no botnet-specific assumptions
+# Use for non-Mirai PCAPs to test generalization
+
+port_map:
+  80:   {endpoint: "/web",    weight: 1.0}
+  443:  {endpoint: "/secure", weight: 1.0}
+  22:   {endpoint: "/ssh",    weight: 1.2}
+  21:   {endpoint: "/ftp",    weight: 1.1}
+  25:   {endpoint: "/smtp",   weight: 1.1}
+  53:   {endpoint: "/dns",    weight: 0.8}
+  8080: {endpoint: "/other",  weight: 1.0}
+
+c2_ports:     []
+c2_endpoints: []
+default_endpoint: "/other"
+default_weight:   1.0

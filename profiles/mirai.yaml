@@ -1,0 +1,20 @@
+# Mirai botnet detection profile
+# Generated from hardcoded values in context_features.py
+# and risk_engine.py
+# To create a new profile: copy this file, rename it,
+# and adjust port_map and c2_ports for the target dataset.
+
+port_map:
+  80:    {endpoint: "/web",        weight: 1.0}
+  443:   {endpoint: "/secure",     weight: 1.5}
+  22:    {endpoint: "/ssh",        weight: 1.8}
+  8080:  {endpoint: "/other",      weight: 1.1}
+  23:    {endpoint: "/telnet",     weight: 1.9}
+  53:    {endpoint: "/dns",        weight: 1.2}
+  8280:  {endpoint: "/mirai_c2",   weight: 2.0}
+  10240: {endpoint: "/mirai_load", weight: 1.8}
+
+c2_ports:     [8280, 10240]
+c2_endpoints: ["/mirai_c2", "/mirai_load"]
+default_endpoint: "/other"
+default_weight:   1.1
