@@ -18,6 +18,7 @@ import argparse
 import csv
 import datetime
 import importlib.metadata
+import json
 import os
 import subprocess
 from kitsune_wrapper import KitsuneDetector
@@ -31,6 +32,8 @@ from profile_scoring import combine_scores
 import explain_pipeline
 from decision_layer.decision_engine import make_decision
 from counterfactual_engine.cf_generator import generate_all_counterfactuals
+
+_feedback_learner = None
 
 RED    = "\033[91m"
 GREEN  = "\033[92m"
@@ -195,6 +198,7 @@ def run(args):
         length_signal  = 1.0
         final_score    = score
         attack_reason  = ""
+        attack_type    = ""
         detection_path = ""
 
         # ── 2. ARA baseline update (training only) ──
@@ -253,6 +257,20 @@ def run(args):
             risk, adjusted_risk = _compute_adjusted_risk(
                 final_score, ctx, config, freq_deviation, length_signal, profile=traffic_profile
             )
+
+            if _feedback_learner is not None:
+                context_key = attack_type or "unknown"
+                risk = _feedback_learner.get_adjusted_risk(
+                    risk, context_key, ["score", "risk"]
+                )
+                _bonus = 0.0
+                if ctx["endpoint"] in ("/ssh", "/secure"):
+                    _bonus += 0.02
+                if freq_deviation > 5.0:
+                    _bonus += 0.01
+                if ctx["freq"] > config["rate_threshold"]:
+                    _bonus += 0.01
+                adjusted_risk = risk + _bonus
 
             # Record temporal event with real z-scores
             explain_pipeline.record_temporal(
@@ -373,7 +391,17 @@ if __name__ == "__main__":
                          dest="training_gate", metavar="N")
     _parser.add_argument("--profile", default=None, metavar="PATH",
                          help="Traffic profile YAML (default: profiles/mirai.yaml)")
+    _parser.add_argument("--feedback-weights", default=None, metavar="PATH",
+                         dest="feedback_weights",
+                         help="Load pre-computed feature weights JSON and apply to risk engine")
     _args = _parser.parse_args()
     import config as _cfg_mod
     _cfg_mod.init_profile(_args.profile)
+    if _args.feedback_weights and os.path.exists(_args.feedback_weights):
+        from feedback.feature_weight_learner import FeatureWeightLearner
+        _learner = FeatureWeightLearner()
+        with open(_args.feedback_weights, encoding="utf-8") as _fh:
+            _learner.adjustments = json.load(_fh)
+        print(f"[Feedback] Loaded weights from {_args.feedback_weights}")
+        _feedback_learner = _learner
     run(_args)
