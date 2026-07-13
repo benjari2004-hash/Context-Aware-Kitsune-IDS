@@ -1,0 +1,14 @@
+# Core IDS pipeline
+numpy>=1.23
+scipy>=1.10
+PyYAML>=6.0
+scapy>=2.5
+
+# Evaluation, plotting, and experiments
+matplotlib>=3.6
+pandas>=1.5
+scikit-learn>=1.2
+
+# Explainability experiments
+shap>=0.42
+lime>=0.2.0.1
