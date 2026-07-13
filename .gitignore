@@ -27,3 +27,4 @@ ground_truth.csv
 # Personal files
 *.docx
 *.pptx
+.py310base/
