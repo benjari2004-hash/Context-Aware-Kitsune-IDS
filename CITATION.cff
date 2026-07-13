@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+title: "Context-Aware Kitsune IDS"
+message: "If you use this software, please cite this repository."
+type: software
+
+authors:
+  - family-names: "Benjari"
+    given-names: "Mohamed"
+
+version: "1.0.0"
+date-released: "2026-07-13"
+
+repository-code: "https://github.com/benjari2004-hash/Context-Aware-Kitsune-IDS"
+
+license: "MIT"
