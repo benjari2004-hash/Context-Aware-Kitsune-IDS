@@ -324,6 +324,15 @@ This repository is intended for:
 Configurations, thresholds, and security policies should be validated in controlled environments before deployment in operational networks.
 
 ---
+## Research Paper
+
+### Override-Locked Decisions in Hybrid NIDS: Formalization and Counterfactual Decomposition
+
+This research investigates structural limitations of counterfactual explanations in hybrid network intrusion detection systems and introduces the concept of override-locked decisions.
+
+The manuscript submitted to the *Journal of Information Security and Applications (JISA)* is available below:
+
+[📄 Read the manuscript](paper/Override_Locked_Decisions_Hybrid_NIDS.pdf)
 
 # Citation
 
