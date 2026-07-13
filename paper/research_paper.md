@@ -1,0 +1,455 @@
+# Context-Aware Counterfactual Explanations for Real-Time Network Intrusion Detection: A Multi-Pass Override Decomposition Framework
+
+**Mohamed Benjari**
+*Computer Science and Security Research, 2026*
+
+---
+
+## Abstract
+
+Anomaly-based network intrusion detection systems (NIDS) achieve high detection rates but produce decisions that security analysts cannot interpret, verify, or act upon — a condition that drives alert fatigue and erodes operational trust. The problem is particularly acute when enforcement decisions are locked by policy overrides: existing counterfactual explanation methods, designed for continuous feature perturbation, cannot explain why a decision is structurally irreversible. This paper presents a context-aware Kitsune IDS pipeline that addresses this gap through a four-pass, latency-bounded counterfactual (CF) engine with a dedicated override decomposition pass. Evaluated on 99,999 packets from a real Mirai IoT botnet capture, the system detects 9,685 anomalies (9.7%) and produces actionable explanations for 97.6% of them. A structural finding emerges from the CF pass distribution: 87.2% of anomalies require Pass 2 (override decomposition) to explain their enforcement decision, while only 10.5% are resolved by single-feature perturbation. This result reveals that for botnet-class traffic, the dominant explanation bottleneck lies in the classification rule — not in the anomaly threshold. The CF engine achieves a mean latency of 0.06 ms per packet (p95: 0.08 ms) with zero timeouts across all four budget modes (STRICT 2 ms, NORMAL 10 ms, RELAXED 50 ms, BATCH unlimited), confirming real-time feasibility. A human-feedback learning module reduces false positive rate from 2.77% to 0.00% within one feedback round using multiplicative weight updates, while a sliding-window drift detector identifies concept drift in all three synthetic transition scenarios tested, though we document a vulnerability to sustained adversarial feedback that establishes no clean baseline (Section IV-G). These findings motivate the pass decomposition architecture as a design requirement for IDS operating on botnet traffic, rather than a performance optimisation.
+
+**Keywords:** network intrusion detection, counterfactual explanation, XAI, KitNET, anomaly detection, feedback learning, concept drift, override decomposition
+
+---
+
+## I. Introduction
+
+Security operations centres (SOCs) are under sustained pressure from alert fatigue. A 2022 survey by Ponemon Institute found that the average security team receives more than 11,000 alerts per day, of which roughly 45% are false positives [1]. The burden falls disproportionately on anomaly-based NIDS, where the absence of explicit decision logic makes individual alerts difficult to triage, verify, or refute. Analysts confronted with an opaque anomaly score have no principled mechanism to determine whether the alert represents a genuine threat, a benign statistical deviation, or a tuning artefact — a problem that Sommer and Paxson identified over a decade ago as the foundational operationalisation challenge of anomaly detection [2].
+
+Explainable AI (XAI) methods have been proposed as a solution. Techniques such as LIME [3] and SHAP [4] generate post-hoc feature attributions that can, in principle, tell an analyst which input features contributed most to an anomaly score. Counterfactual explanations [5] go further: they answer the actionable question, "What would have had to be different for this packet to have been allowed?" — giving the analyst a concrete, hypothetical handle on the decision boundary. Both families of methods have been applied to NIDS settings [6][7], demonstrating that feature-level explanations can reduce analyst response time and improve decision confidence.
+
+However, a critical gap exists in the current literature: none of these methods account for **policy-level override locking**. Modern hybrid NIDS — systems that combine an anomaly detector with a rule-based attack classifier and a structured decision layer — produce enforcement decisions that cannot be reversed by any perturbation of the anomaly score alone. When a packet is classified as "Mirai C2 Communication" and the decision layer issues a BLOCK via a hard override, no reduction in the KitNET RMSE score will change that outcome. The correct counterfactual explanation is structural: "This packet would have been ALLOWED if the attack classification rule had not fired" — but this explanation requires decomposing the override logic, not perturbing a continuous feature. Existing CF methods, which assume a differentiable or at least monotone scoring function, cannot produce this class of explanation.
+
+This paper makes four primary contributions:
+
+1. **A multi-pass counterfactual engine with override decomposition (Pass 2)** that explains policy-locked decisions by stripping the attack classification override and computing the hypothetical action under the baseline risk model, then identifying the minimum score or risk change that would further shift that action. Pass 2 is, to our knowledge, the first published CF method specifically designed for the override layer of hybrid NIDS.
+
+2. **A structural finding on the dominance of override-locked decisions**: evaluated on 9,685 detected anomalies from a Mirai IoT botnet capture, 87.2% (8,440 packets) require Pass 2 to receive a meaningful explanation, while only 10.5% (1,014 packets) are explained by single-feature perturbation (Pass 1). This result holds because 86.0% of anomalies are classified as Mirai C2 Communication — a botnet-specific traffic pattern whose enforcement decision is structurally override-locked.
+
+3. **Real-time CF feasibility with a latency of 0.06 ms per packet**: across four budget modes with designed limits of 2 ms, 10 ms, 50 ms, and no limit, the CF engine records zero timeouts and a p95 latency of 0.08 ms, confirming that explanation generation does not constrain packet-level processing.
+
+4. **A feedback learning module that eliminates false positives within one round**: using multiplicative weight updates (MWU) and a threshold adaptation mechanism, the system reduces the false positive rate from 2.77% to 0.00% after a single analyst feedback round on a test set containing 2,000 injected false positive packets (81,999 evaluable rows).
+
+The remainder of this paper is organised as follows. Section II surveys related work. Section III describes the system architecture. Section IV presents experimental results. Section V discusses implications and limitations. Section VI concludes with directions for future work.
+
+---
+
+## II. Background and Related Work
+
+### A. Anomaly-Based Network Intrusion Detection
+
+Anomaly-based NIDS identify malicious traffic by comparing observed behaviour against a baseline model of normality, flagging deviations as anomalies. This approach generalises to novel attacks — unlike signature-based systems, which require prior knowledge of attack patterns — but introduces a fundamental challenge: without an explicit attack model, detected anomalies carry no semantic content, and analysts receive only a numeric score.
+
+KitNET [8], introduced by Mirsky et al. in 2018, addresses scalability in anomaly-based NIDS through an online, unsupervised ensemble of lightweight autoencoders. Each autoencoder operates on a correlated subset of features produced by the AfterImage statistics module, which computes five running statistics (mean, standard deviation, radius, magnitude, and correlation) for each of up to five network channel abstractions (MAC-IP, IP, socket, host-port, and host-host). The ensemble output — an RMSE reconstruction error — serves as the anomaly score. KitNET requires no labelled data and processes packets at line rate, making it attractive for deployment in resource-constrained environments. However, KitNET's reconstruction error is a continuous scalar with no semantic grounding: an RMSE of 0.35 conveys no more information to an analyst than a Z-score without a distribution reference.
+
+Buczak and Guven [9] survey machine learning methods for cyber security intrusion detection, noting that the dominant challenge across all anomaly detection paradigms is the generation of actionable alerts — alerts that give an analyst sufficient context to make a confident triage decision. This requirement motivates the explainability layer described in this paper.
+
+### B. Counterfactual Explanations
+
+Wachter, Mittelstadt, and Russell [5] established counterfactual explanations as a principled approach to algorithmic transparency [19], framing the problem as finding the minimum perturbation to an input that changes a model's output. Their formulation is model-agnostic and optimises for sparsity (few changed features) and proximity (small magnitude of change), properties that directly translate to the analyst context: a sparse, proximate CF tells an analyst precisely which signal drove the decision and how far from the boundary the packet currently lies.
+
+DICE (Diverse Counterfactual Explanations) [10], proposed by Mothilal et al., extends this by generating a set of diverse CFs rather than a single nearest counterfactual, enabling analysts to see multiple equally valid explanations and choose the one most aligned with their remediation capabilities. LEMNA [11], by Guo et al., specifically targets deep-learning-based security applications: it approximates the local decision boundary with a mixture model and generates feature-level explanations through perturbation sampling. DICE, LEMNA, and the model-agnostic CF framework of Karimi et al. [20] all assume a differentiable or continuously-approximable scoring function. None can address the override-locked decisions that arise in hybrid NIDS where a rule-based classifier determines the enforcement action independently of the anomaly score.
+
+### C. XAI for Security
+
+The application of XAI to intrusion detection has gained traction with the availability of explainable ML toolkits. Lundberg and Lee [4] (SHAP) demonstrated that additive feature attributions can be computed efficiently for tree-based and neural classifiers; several works have applied SHAP to NIDS feature attribution [6]. LIME [3] has similarly been applied to IDS models in the UNSW-NB15 and NSL-KDD evaluation settings [7], where it identifies which network statistics — packet rate, byte count, connection duration — contribute most to anomaly classifications.
+
+However, these attributions are fundamentally retrospective: they explain why a score was high, not what would have had to change for the decision to be different. In operational settings where analysts must prioritise and respond to alerts in real time, the counterfactual framing is significantly more actionable [5]. Furthermore, neither SHAP nor LIME account for the decision layer between the anomaly score and the enforcement action: in a hybrid NIDS, a SHAP attribution on the KitNET score does not explain why that score produced a BLOCK rather than an ALERT.
+
+### D. Adaptive IDS and Feedback Learning
+
+Online learning in NIDS addresses the challenge that network traffic distributions shift over time — a phenomenon known as concept drift. A classifier trained on a static snapshot of normal traffic will progressively degrade as new protocols, services, and attack patterns emerge. Adaptive detection systems respond to this by updating their model parameters in response to new data [12].
+
+Bifet and Gavalda [13] introduced ADWIN (Adaptive Windowing), a statistically grounded algorithm for detecting and adapting to change in data streams by maintaining a sliding window and testing whether two sub-windows have different means. ADWIN has been applied to intrusion detection for drift detection in TCP flow features. Gama et al. [14] proposed the Drift Detection Method (DDM), which monitors the error rate of a classifier and signals drift when the error rate rises significantly above the baseline observed during a low-error period.
+
+Human-in-the-loop approaches introduce analyst feedback as an additional learning signal. Active learning systems for IDS [15] ask analysts to label uncertain examples, prioritising the most informative queries to maximise labelling efficiency. The system described in this paper extends this paradigm: rather than querying the analyst, it processes unsolicited feedback (false positive and true positive markings) and uses that signal both to adjust per-context feature weights and to detect concept drift from the pattern of analyst corrections.
+
+### E. Research Gap
+
+The combination of these threads — counterfactual explanation, hybrid NIDS decision layers, and human feedback — has not previously been addressed in an integrated framework. Existing CF methods cannot explain override-locked decisions; existing XAI-for-IDS methods do not account for policy layers; and adaptive IDS systems that incorporate human feedback have not modelled the analyst's FP signal as a drift indicator. This paper addresses all three gaps.
+
+---
+
+## III. System Architecture
+
+### A. Overview
+
+The system processes raw PCAP network captures through a linear pipeline: feature extraction and anomaly scoring (KitNET), risk amplification (risk engine), threshold-based detection (adaptive threshold), attack classification (rule engine), structured enforcement (decision layer), multi-module explanation (explainability quad), and finally counterfactual generation and feedback learning. Figure 1 illustrates the pipeline.
+
+```
+  PCAP
+   │
+   ▼
+ KitNET (AfterImage → RMSE score)
+   │
+   ▼
+ Risk Engine (RMSE × endpoint × rate × jitter multipliers)
+   │
+   ▼
+ Adaptive Threshold ──────────────────────────→ NORMAL
+   │ (anomaly detected)
+   ▼
+ Attack Classifier (7-tier rule engine)
+   │
+   ▼
+ Decision Layer (severity 0-5, action, hard override)
+   │ ANOMALY
+   ▼
+ Explainability Quad (ARA + BFDE + RSDR + Narrative)
+   │
+   ▼
+ CF Engine (Pass 1 → Pass 2 → Pass 3 → Pass 4)
+   │
+   ▼
+ Feedback Learning (MWU weights + threshold adapt + drift)
+```
+
+### B. Detection Layer
+
+**KitNET and AfterImage.** KitNET [8] processes each packet through the AfterImage feature extractor, which maintains exponentially decaying statistics over five network channel abstractions. The extractor produces a feature vector of up to 100 dimensions representing running mean, standard deviation, radius, magnitude, and Pearson correlation for each channel at multiple time-decay constants (λ = 5, λ = 3, λ = 1). KitNET trains an ensemble of lightweight autoencoders on the first FMgrace + ADgrace packets (20,000 in this deployment, split equally), then enters detection mode where each packet's reconstruction RMSE is the anomaly signal.
+
+**Risk Engine.** The raw RMSE score is amplified by a composite risk engine that applies context-dependent multipliers. The risk score is computed as a product of the base RMSE, an endpoint weight drawn from a traffic profile (reflecting the threat significance of the destination service), a rate multiplier applied when packet frequency exceeds a threshold (50 packets per 30-second window), a jitter multiplier for irregular inter-arrival timing, and a packet length signal. Context features — destination port, protocol, inter-arrival timing, unique endpoints contacted, and length variance — are extracted from each packet at detection time. This multi-signal risk formulation ensures that identical KitNET scores produce different risk levels depending on the operational context of the traffic.
+
+**Adaptive Threshold.** The threshold separating NORMAL from ANOMALY is maintained by an online adaptive mechanism using Welford's algorithm to track the running mean and standard deviation of risk scores over a sliding window of 250 samples. Three operational modes are supported: high_security (k=1.6), balanced (k=1.8), and low_noise (k=2.5), where k is the number of standard deviations above the mean that defines the detection boundary. A maximum threshold cap of 2.5 prevents unbounded drift toward false negatives. In the experimental deployment reported here, the system operated in low_noise (NORMAL) mode.
+
+### C. Classification Layer
+
+Anomaly-detected packets are passed to a seven-tier rule-based attack classifier that assigns a semantic attack label based on a combination of KitNET score, risk, context features, and packet-level signals. Rules are ordered from most-specific to least-specific, following the principle that narrow, high-confidence patterns should be evaluated before broad, low-specificity rules.
+
+The tier ordering is: (1) Mirai C2 / loader port traffic, (2) stealth / low-and-slow intrusion, (3) C2 beaconing via uniform small packets, (4) data exfiltration via mixed-size payloads, (5) port scanning via multi-endpoint contact, (6) DoS / flood via high-rate traffic, and (7) a catch-all "Suspicious Activity" tier. This ordering is critical: without it, the broad DoS/Flood rule (high frequency AND non-zero score) would match approximately 96% of Mirai detection-phase packets before any narrower rule could fire, collapsing the label distribution to a single category.
+
+### D. Decision Layer
+
+**Definition 1 (Override-Locked Decision).** Let *f*: S × R × T × Q → A denote the hybrid NIDS decision function, where S is the anomaly score space, R the risk score space, T the set of attack-type labels (including the empty label ∅), Q the frequency space, and A the enforcement action set. Let Ω: T → A be a partial function (the *override matrix*) defined on a subset T_Ω ⊂ T. When t ∈ T_Ω, the decision function satisfies *f*(s, r, t, q) = Ω(t) for all (s, r, q). A decision *f*(s, r, t, q) = a is **override-locked** iff t ∈ T_Ω. Equivalently, the action a is invariant under any perturbation (s, r, q) → (s′, r′, q′) provided t is preserved. In this implementation, T_Ω = {Mirai C2 Communication, DoS / Flood, C2 Beacon} with Ω given by `ATTACK_OVERRIDES` (action_matrix.py, reproduced below).
+
+The decision layer maps the tuple (anomaly score, risk, attack_type, packet frequency) to a structured enforcement decision comprising a severity level (0–5), a human-readable severity label, an enforcement action, and a decision reason. The action set is ordered by severity: ALLOW (severity 0), MONITOR (severity 1–2), ALERT_LOW (severity 2–3), ALERT_HIGH (severity 3–4), RATE_LIMIT (severity 4), and BLOCK (severity 4–5).
+
+The layer implements two hard override mechanisms that supersede the threshold-based decision:
+
+- **hard_override_risk**: when risk exceeds 1.5, the packet is immediately classified as ANOMALY and routed to BLOCK regardless of the adaptive threshold outcome.
+- **hard_override_score**: when the KitNET score exceeds a saturation ceiling (≥0.99), indicating the autoencoder has been maximally surprised, the packet is similarly force-routed.
+
+The attack_type override adds a third dimension: three attack classifications carry hard enforcement overrides — Mirai C2 Communication (→ BLOCK), DoS / Flood (→ RATE_LIMIT), and C2 Beacon (→ ALERT_HIGH) — as encoded in the `ATTACK_OVERRIDES` dictionary (action_matrix.py). Per Definition 1, packets classified into these categories are override-locked: the enforcement action is determined entirely by the classification label and is invariant under any perturbation of the anomaly score, risk, or frequency. These overrides cannot be reduced by the adaptive threshold. Port Scan, Stealth Intrusion, and other classifier output categories are *not* in T_Ω and are therefore not override-locked; their actions are governed by the severity matrix.
+
+The interaction of these override mechanisms is central to the CF pass distribution described in Section IV.
+
+### E. Explainability Layer
+
+Four independent explanation modules run in parallel for each detected anomaly:
+
+**ARA (Autoencoder Reconstruction Anatomy).** Identifies which input feature dimensions deviated most from the learned normal baseline, using per-dimension Z-scores computed over an online running mean maintained throughout the training phase. The top-k most anomalous dimensions are reported with their deviation magnitude and a directional label (elevated / suppressed).
+
+**BFDE (Behavioral Fingerprint Deviation Explanation).** Maintains per-entity (per-source-IP) behavioral baselines using Welford's algorithm, and computes how the current packet's frequency, packet length, and endpoint diversity deviate from the entity's established normal behavior. Categorical features (destination endpoint) are handled via frequency-based comparison rather than Z-scores, avoiding the distortion that arises when treating nominal values as numeric.
+
+**RSDR (Risk Score Decomposition Report).** Decomposes the final risk score into its constituent signals — base KitNET RMSE, endpoint weight contribution, rate multiplier activation, jitter multiplier, and length signal — providing a layered audit trail of the risk computation. This separation of model output (RMSE) from heuristic multipliers is critical for interpretability: analysts can distinguish genuine autoencoder anomalies from context-driven risk amplification.
+
+**Narrative Engine.** Synthesises the outputs of the other three modules into a natural-language paragraph tailored to the detected attack type. The narrative identifies the primary anomaly signal, the behavioral deviation from entity baseline, the risk amplification factors, and the specific endpoint involved. Narratives are generated only for anomalous packets; normal traffic produces no narrative output.
+
+### F. Counterfactual Engine
+
+The CF engine is the primary contribution of this paper. It operates in four sequential passes, each attempting to find the minimum perturbation that would change the enforcement decision. A latency budget is checked between passes: if the elapsed wall-clock time exceeds the configured budget, the engine halts and returns the best explanation found so far.
+
+**Pass 1 — Single-Feature Perturbation.** Evaluates 9 candidate values for each of three perturbable features (score, risk, packet frequency) drawn from pre-defined search grids. For each candidate, the decision layer is re-evaluated with the candidate value substituted for the original. If any candidate changes the enforcement action, the minimum-relative-change candidate is returned as the CF explanation. Pass 1 explains decisions where a single feature is the proximate cause of the enforcement — typically cases where the risk or frequency is near the decision boundary.
+
+**Pass 2 — Override Decomposition.** This is the novel contribution of this paper. Pass 2 only fires when the packet's attack_type is found in the attack override matrix — that is, when the enforcement decision is policy-locked. It operates in two layers. Layer 1 removes the attack classification entirely and re-evaluates the decision using only the raw risk score; this produces the "baseline action" — what the system would have decided without the override. Layer 2 then identifies the minimum score or risk change (again from the search grid) that would further shift the baseline action to a less severe level. The combined explanation reads: "This packet is BLOCKED because it was classified as [attack_type]. Without that classification, the action would be [baseline_action]. If, additionally, [feature] were [value], the action would be [less_severe_action]."
+
+**Pass 3 — Temporal Counterfactual.** Answers the question: "If this had been the first packet from this source, would it have been blocked?" Pass 3 re-evaluates the decision with the packet frequency reset to 1 (simulating a first-contact packet with no established behavioral history), holding all other features constant. This explanation is particularly relevant for port-scan and DoS detections, where accumulated frequency is the primary trigger.
+
+**Pass 4 — Multi-Feature Pairs.** Evaluates pairs of features simultaneously from reduced search grids (5 candidates per feature, O(n²) budget), identifying two-feature combinations that produce a decision change. Pass 4 is implemented in the offline `generate_all_counterfactuals()` API in cf_generator.py but is not invoked by the `LatencyBoundedCFGenerator` (cf_realtime.py) in any budget mode, including RELAXED and BATCH. The real-time benchmark in Section IV-D therefore does not exercise Pass 4.
+
+**Budget Modes.** Four latency budget modes control which passes are attempted within a wall-clock time limit: STRICT (2 ms), NORMAL (10 ms), RELAXED (50 ms), and BATCH (no limit). The budget is checked after each pass; if exceeded, the engine returns the current best explanation and increments the timeout counter.
+
+### G. Feedback Learning
+
+**FeatureWeightLearner.** Uses a multiplicative weight update (MWU) rule [18] to adjust per-context, per-feature weights based on analyst feedback. When an analyst marks a detected anomaly as a false positive (FP), the weight for the CF feature in that attack context is multiplied by decrease_rate (0.85 by default). When an analyst confirms a true positive (TP), the weight is multiplied by increase_rate (1.05). Weights are bounded to [0.3, 2.0]. During inference, the adjusted risk score is computed as the raw risk multiplied by the product of learned weights for the relevant features in the current context.
+
+**FeedbackAdaptiveThreshold.** Adjusts the hard_override risk threshold in response to the analyst FP/FN signal stream. FP feedback raises the threshold (the system is too sensitive; relax the boundary); FN feedback lowers it (the system is missing attacks; tighten the boundary). Changes are bounded per step at 0.05 to resist feedback poisoning. The threshold evolves from an initial value of 1.5 within a range of [0.5, 3.0].
+
+**FeedbackDriftDetector.** Detects concept drift by monitoring the analyst FP rate in a sliding window of 200 feedback records and comparing it to an established baseline computed over the first 50 records. If the current FP rate exceeds the baseline by more than 0.15, drift is declared. This approach is novel: it uses human judgment — analyst corrections — as the drift signal, rather than data distribution statistics. This makes the drift detector sensitive to shifts in threat behaviour that alter the system's false positive rate, even before those shifts are detectable in the feature distribution alone.
+
+---
+
+## IV. Experimental Evaluation
+
+### A. Dataset and Experimental Setup
+
+The system was evaluated on a full capture of the Mirai IoT botnet attack (*mirai.pcap*). The capture contains 99,999 packets and was processed in a single pipeline run using the NORMAL operational mode (FMgrace = ADgrace = 10,000 packets, hard_override risk threshold = 1.5). The first 20,000 packets constitute the training phase; the remaining 79,999 form the detection phase. The pipeline ran on 2026-05-10 using KitNET with numpy 1.23.5 and scapy 2.5.0.
+
+**Ground Truth Limitation.** Ground truth labels (used only in the feedback learning experiments) were generated synthetically from the Kitsune paper's published attack timeline — not from per-packet annotation. These labels are appropriate for evaluating the feedback learning mechanism and the CF engine pipeline, but do not constitute publishable detection performance metrics. All detection results reported in Sections IV-B and IV-C are therefore framed as system behaviour characterisations, not precision/recall claims against a validated ground truth.
+
+Feedback learning experiments (Sections IV-E through IV-H) were conducted on an augmented dataset created by the FPInjector module, which added 2,000 synthetic false positive packets to the detection-phase results. The injected dataset contained 81,999 evaluable rows (72,314 labelled true-NORMAL, 9,685 true-ANOMALY).
+
+### B. Detection Results
+
+**Table I: Packet Label and Action Distribution**
+
+| Category | Count | % of Total |
+|---|---|---|
+| TRAIN (grace phase) | 20,000 | 20.0% |
+| NORMAL | 70,314 | 70.3% |
+| ANOMALY | 9,685 | 9.7% |
+| **Total** | **99,999** | **100%** |
+
+| Action | Count | % of Total |
+|---|---|---|
+| ALLOW | 62,126 | 62.1% |
+| MONITOR | 15,381 | 15.4% |
+| ALERT_LOW | 12,762 | 12.8% |
+| BLOCK | 8,646 | 8.6% |
+| ALERT_HIGH | 942 | 0.9% |
+| RATE_LIMIT | 142 | 0.1% |
+
+The detection rate of 9.7% in the Mirai capture is consistent with the known traffic composition of the Kitsune benchmark dataset, where attack traffic is concentrated in the second half of the capture following the IoT infection and C2 establishment phases.
+
+**Table II: Attack Type Distribution Among Detected Anomalies**
+
+| Attack Type | Count | % of Anomalies |
+|---|---|---|
+| Mirai C2 Communication | 8,332 | 86.0% |
+| Port Scan | 1,211 | 12.5% |
+| DoS / Flood | 104 | 1.1% |
+| Stealth Intrusion | 26 | 0.3% |
+| C2 Beacon | 4 | 0.04% |
+| High-Risk Anomaly | 4 | 0.04% |
+| ICMP Flood | 1 | 0.01% |
+| Unclassified Anomaly | 3 | 0.03% |
+
+The dominance of Mirai C2 Communication (86.0%) reflects the Mirai botnet's characteristic behaviour: after infection, compromised IoT devices maintain persistent, high-rate communication with C2 servers on ports 8280 and 10240. This traffic pattern is highly distinctive, triggering Tier 1 of the classifier (the narrowest, most specific rule tier) on effectively every post-infection packet.
+
+**Detection Path Analysis.** Of the 9,685 detected anomalies, 9,597 (99.1%) were detected via `hard_override_risk` — the mechanism that triggers when the computed risk score exceeds the configured threshold of 1.5. Only 81 anomalies (0.8%) were detected via the adaptive threshold path, and 7 (0.07%) via `hard_override_score` (saturation). The mean anomaly score was 0.351 (median 0.323, maximum 1.000); the mean risk was 1.930 (maximum 3.367).
+
+The near-complete dominance of the hard_override_risk path is architecturally significant: the adaptive threshold mechanism — designed to adjust dynamically to the traffic distribution — contributed detection for fewer than 1% of anomalies. This finding, discussed further in Section V, suggests that the risk engine's baseline sensitivity is sufficient to catch Mirai C2 traffic without adaptive adjustment, and that the adaptive threshold adds value primarily in lower-intensity, mixed-traffic scenarios.
+
+### C. Counterfactual Analysis
+
+**Table III: CF Pass Distribution on 9,685 Detected Anomalies**
+
+| Pass | Count | % of Anomalies | Description |
+|---|---|---|---|
+| Pass 1 (single-feature flip) | 1,014 | 10.5% | Decision reversed by perturbing score, risk, or frequency |
+| Pass 2 (override decomposition) | 8,440 | 87.2% | Decision explained via attack classification override removal |
+| Unexplained residual | 231 | 2.4% | Passes 1–3 exhausted without a successful CF; Pass 4 not invoked in real-time mode |
+| **Total CF covered** | **9,454** | **97.6%** | |
+
+*Note: Pass 3 (temporal counterfactual, freq=1 simulation) and Pass 4 (multi-feature pairs) are the final explanation mechanisms. Pass 3 was invoked on all 231 residual packets but produced no successful counterfactual on this capture. Pass 4 was not invoked: the `LatencyBoundedCFGenerator` (cf_realtime.py) implements Passes 1–3 only; Pass 4 is available via the `generate_all_counterfactuals()` API but was not included in the latency benchmark. The 231 packets therefore constitute the unexplained residual — decisions for which no explanation was found within the implemented real-time pass sequence.*
+
+The CF coverage of 97.6% means that for all but 231 anomalies, the engine produced at least one actionable counterfactual explanation. The distribution across passes is the central finding of this paper.
+
+**The Override Dominance Finding.** 87.2% of anomalies received their CF explanation from Pass 2 (override decomposition). This figure is not incidental: it directly reflects the attack type distribution. All 8,332 Mirai C2 Communication packets received BLOCK decisions via the attack_type override (the Mirai C2 rule fires unconditionally when traffic is destined for port 8280 or 10240 with a non-trivial anomaly score). For these packets, the risk score is irrelevant to the enforcement decision — the policy override takes precedence regardless of its magnitude. A single-feature perturbation of the risk score cannot change the action, because the action is determined by the classification rule. Only Pass 2, which removes the classification and re-evaluates under the baseline risk model, can produce a meaningful explanation.
+
+The 10.5% of anomalies explained by Pass 1 correspond to non-Mirai attacks: Port Scan (1,211 packets, most resolved by reducing frequency below the scan detection threshold), Stealth Intrusion (26 packets, resolved by reducing the RMSE score), and High-Risk Anomaly (4 packets). These are precisely the categories where no hard attack-type override is in effect, and the decision boundary is a continuous function of score, risk, and frequency.
+
+The 2.4% unexplained residual (231 packets) represent cases where neither single-feature perturbation (Pass 1) nor override decomposition (Pass 2) nor the temporal first-contact simulation (Pass 3) produced a successful counterfactual. These are anomalies that are not override-locked (attack_type ∉ T_Ω, so Pass 2 did not fire) yet whose decision boundary lies beyond the search grid for every perturbable feature. Typically these are high-severity Port Scan or DoS detections where the required feature reduction to change the action is larger than the maximum search-grid value. Whether Pass 4 (multi-feature pairs) would resolve any of these cases is not measured in this evaluation.
+
+The practical implication for IDS design is direct: any NIDS deploying a hybrid detection-plus-classification architecture with policy overrides must implement a Pass 2-equivalent mechanism. Systems that deploy only LIME, SHAP, or single-feature CF methods will be unable to explain approximately 87% of their most severe enforcement decisions in Mirai-class scenarios.
+
+### D. CF Latency Benchmark
+
+The CF engine was benchmarked across all four budget modes on the full set of 9,685 anomaly packets. Each packet was run through the complete pass sequence for its mode; wall-clock latency was recorded per packet using Python's `time.perf_counter()`.
+
+**Table IV: CF Engine Latency Across Budget Modes (n = 9,685 anomalies per mode)**
+
+| Mode | Budget | Avg (ms) | p50 (ms) | p95 (ms) | Max (ms) | Coverage | Timeouts |
+|---|---|---|---|---|---|---|---|
+| STRICT | 2 ms | 0.061 | 0.059 | 0.083 | 0.247 | 97.6% | 0 |
+| NORMAL | 10 ms | 0.060 | 0.059 | 0.081 | 0.307 | 97.6% | 0 |
+| RELAXED | 50 ms | 0.057 | 0.056 | 0.074 | 0.313 | 97.6% | 0 |
+| BATCH | None | 0.062 | 0.060 | 0.084 | 0.327 | 97.6% | 0 |
+
+The zero timeout count across all modes is the most striking result of the latency benchmark. The tightest budget, STRICT (2 ms), was never violated despite allowing only 2,000 µs per packet — the observed maximum latency of 0.247 ms is 8× below the STRICT ceiling. The CF engine's Python implementation, which evaluates at most 27 decision-layer calls per pass per packet (9 candidates × 3 features), runs in under 0.1 ms at p95, confirming that CF generation is computationally compatible with packet-level processing rates.
+
+The latency uniformity across modes — the four averages span only 0.004 ms — reflects the fact that the vast majority of packets (87.2%) are resolved at Pass 2, which itself is computationally simpler than Pass 1 (Pass 2 evaluates the decision layer twice for the override check, then runs a reduced grid for Layer 2). Pass 3 is reached on the 231 residual packets (2.4%) but produces no successful counterfactual on this capture; its evaluation cost is bounded and contributes negligibly to the aggregate latency distribution. Pass 4 is not invoked in the real-time benchmark (Section III-F).
+
+These results establish that the four budget modes are safety boundaries, not active rate limiters: on Mirai-class traffic, any budget above approximately 0.3 ms would be sufficient to guarantee zero timeouts. The modes gain practical relevance in higher-volume deployments or on hardware with lower per-operation throughput than the test platform.
+
+### E. Experiment A — False Positive Reduction Under Feedback Pressure
+
+Experiment A evaluated whether analyst feedback can reduce the false positive rate on a dataset with injected FP pressure (2,000 synthetic FP packets among 81,999 evaluable rows). Ten feedback rounds were run, with 100 feedback records sampled per round from the detected anomaly pool and a 5% label noise rate. At each round, the FeedbackAdaptiveThreshold module updated the risk threshold, and the FeatureWeightLearner updated per-context weights.
+
+**Table V: Experiment A — Per-Round Metrics (Selected Rounds)**
+
+| Round | Threshold | FP Rate | FN Rate | F1 Score |
+|---|---|---|---|---|
+| 0 (baseline) | 1.500 | 2.77% | 0.86% | 0.9021 |
+| 1 | 1.692 | 0.00% | 0.59% | 0.9970 |
+| 2 | 1.807 | 0.00% | 0.54% | 0.9973 |
+| 3 | 1.916 | 0.00% | 0.64% | 0.9968 |
+| 5 | 2.250 | 0.00% | 1.05% | 0.9947 |
+| 8 | 2.741 | 0.00% | 1.67% | 0.9916 |
+| 10 | 3.000 | 0.00% | 1.86% | 0.9906 |
+
+FP elimination was achieved within a single feedback round: after Round 1, the threshold had risen from 1.500 to 1.692, reclassifying injected FPs as NORMAL. F1 peaked at Round 2 (0.9973) before declining as the threshold continued rising, reclassifying an increasing fraction of true positives as NORMAL. The FN rate rose monotonically from 0.86% to 1.86% across the 10 rounds, reaching 1.86% at Round 10 — a trade-off that reflects the threshold adaptation mechanism's incremental nature: once FP pressure is removed, the threshold has no signal to reverse its upward drift.
+
+This trajectory suggests an optimal early stopping at Round 2–3, where FP is zero and FN remains below 1%. Without an explicit stopping criterion (e.g., FN rising above a configured limit), the threshold adaptation mechanism will continue rising until it reaches its configured maximum (3.000). This behavioural characteristic is discussed in Section V.
+
+### F. Experiment B — Ablation Study
+
+Experiment B compared four system configurations across 10 rounds with 100 feedbacks per round:
+
+**Table VI: Experiment B — Final FP Rate by Configuration**
+
+| Configuration | FP Rate (Round 0) | FP Rate (Round 10) |
+|---|---|---|
+| A: Static (no learning) | 2.77% | 2.77% |
+| B: Threshold adaptation only | 2.77% | 0.00% |
+| C: Weight learning only | 2.77% | 0.00% |
+| D: Full system (both) | 2.77% | 0.00% |
+
+All three adaptive configurations eliminated FP by Round 10. The static baseline remained at 2.77% throughout, confirming that the FP reduction is driven by the learning mechanism rather than by stochastic sampling effects. The threshold-only and weight-only configurations converged to 0.00% FP, indicating that each mechanism individually is sufficient to eliminate FP pressure under these conditions. The full system (D) provides the most robust adaptation but does not reduce the final FP rate beyond what either individual mechanism achieves — a finding that motivates further investigation of whether the two mechanisms are redundant or complementary in scenarios with greater distribution shift.
+
+### G. Experiment C — Poisoning Resistance
+
+Experiment C evaluated the system's robustness to adversarial feedback across three scenarios. All scenarios used 10 rounds with 100 feedbacks per round.
+
+**C1 — 20% Random Noise.** All feedback labels were randomly flipped with probability 0.20. Final state: FP = 0.00%, FN = 12.27%, drift not detected. The threshold still rose sufficiently to eliminate FP, but the noisy TP signal caused the weight learner to incorrectly reduce weights for genuinely anomalous features, inflating FN. The FN rate of 12.27% represents a significant degradation in detection sensitivity that would be operationally unacceptable, though the system continued operating without catastrophic failure.
+
+**C2 — Malicious Analyst (All FP).** Every feedback record was forced to type "fp", simulating a malicious insider analyst intentionally miscorrecting all detections. Final state: FP = 0.00%, FN = 100.00%, drift not detected. The threshold rose to its maximum (3.000), reclassifying all anomalies as NORMAL. This is a critical vulnerability: a single actor providing consistent adversarial feedback can completely disable detection in 10 rounds. The drift detector did not trigger because the injected FP rate was constant from Round 1 — there was no *change* in the FP rate to detect.
+
+**C3 — Adversarial (TP packets forced as FP).** True attack packets were mislabelled as FP. Final state: FP = 0.00%, FN = 100.00%, drift not detected. The result is identical to C2, for the same reason.
+
+The C2/C3 vulnerability represents an honest and important finding. The drift detector, in its current form, requires a *transition* from low to high FP rate to trigger; a sustained high FP rate from the first round establishes a high baseline and is never distinguished from normal operation.
+
+### H. Experiment D — Concept Drift Detection
+
+Experiment D tested three drift scenarios over 15 rounds. The FeedbackDriftDetector monitored the analyst FP rate in a 200-sample sliding window.
+
+**D1 — Sudden Drift at Round 6.** Rounds 1–5 used benign feedback; Rounds 6–15 forced all-FP. Drift was detected at Round 6 — the first round of adversarial feedback. The detector responded within one round, consistent with a window of 200 observations being quickly filled by the 100 FP feedbacks at Round 6.
+
+**D2 — Gradual Ramp.** FP probability increased linearly from 0 to 1 over 15 rounds. Drift was detected at Round 5, when the FP rate crossed the baseline-plus-threshold criterion. The detection occurred before the FP rate reached 50%, demonstrating that the detector can identify gradual drift before it becomes severe.
+
+**D3 — Recurring Drift.** Even-numbered rounds forced all-FP; odd-numbered rounds forced all-TP. Drift was detected at Round 2, the first even-numbered round. The detector's rapid response to the first FP round shows that the 200-sample window is filled quickly enough at 100 feedbacks per round to detect the alternating pattern.
+
+All three drift scenarios were successfully detected. The C2/C3 failure (no detection when FP rate is uniformly high from Round 1) is not a contradiction: the drift detector is a *change* detector, not an absolute-level detector. A complementary mechanism — such as a global FP rate alarm that fires when the absolute rate exceeds a configured limit — would be needed to catch the coordinated-attack scenario.
+
+### I. Experiment E — Parameter Sensitivity
+
+Experiment E characterised the sensitivity of the final FP rate to three hyperparameters over 10 rounds with 100 feedbacks per round and 5% label noise.
+
+**Decrease rate** (MWU parameter for FP feedback) was varied over {0.70, 0.80, 0.85, 0.90, 0.95}. All values achieved 0.00% final FP, with the optimal value identified as 0.70 — the most aggressive weight reduction per FP event. The result indicates that in this setting, the weight decrease rate does not affect the binary convergence outcome, though it may affect the speed and stability of convergence in scenarios with lower FP signal intensity.
+
+**Learning rate** (threshold adaptation step size) was varied over {0.005, 0.01, 0.02, 0.05}. All values achieved 0.00% final FP, with the optimal value identified as 0.005. Smaller learning rates produce smoother, more conservative threshold trajectories, which is preferable in operational settings to avoid over-reaction to noise.
+
+**Feedbacks per round** was varied over {20, 50, 100, 200}. All values achieved 0.00% final FP. The system demonstrates low sensitivity to feedback volume across this range, suggesting that even infrequent analyst engagement (20 feedbacks per round) is sufficient to drive FP elimination under the experimental conditions.
+
+---
+
+## V. Discussion
+
+### A. Why 87.2% Pass 2? Structural Implications for IDS Design
+
+The finding that 87.2% of anomalies require override decomposition to receive a meaningful counterfactual explanation is a direct consequence of the Mirai botnet's traffic characteristics: Mirai C2 packets are structurally identifiable by their destination port (8280 or 10240), making the attack classification a binary, deterministic function of the packet header. Once classified as Mirai C2 Communication, the enforcement decision is governed entirely by the attack_type override matrix, not by the continuous risk score.
+
+This has a non-obvious implication for IDS design philosophy. Designers who focus explainability effort on the anomaly score layer — whether through SHAP attributions on the autoencoder weights, LIME approximations of the decision boundary, or single-feature CF perturbation — are optimising for the 10.5% of decisions where the anomaly score is the proximate cause. For the 87.2% majority, the proximate cause is a classification rule, and the explanation must address that rule. A system that deploys only score-level explanation is structurally incomplete for botnet-class traffic.
+
+The implication generalises beyond Mirai: any hybrid NIDS that classifies detected anomalies into attack categories and applies per-category policy overrides will exhibit this phenomenon. The fraction of override-locked decisions depends on the attack distribution: in deployments where DoS, reconnaissance, or exfiltration are the dominant threats, the Pass 1 fraction may be higher. But any system targeting C2 communication, lateral movement with fixed indicators of compromise, or other rule-classifiable attack patterns will require a Pass 2-equivalent mechanism.
+
+### B. CF Latency and Budget Modes
+
+The zero-timeout result across all four budget modes, combined with a maximum observed latency of 0.327 ms, indicates that the designed budget hierarchy (2 ms / 10 ms / 50 ms) is not active on Mirai-class traffic: the CF engine completes all necessary passes well within even the tightest budget. The budget modes are relevant in two scenarios not present in this evaluation: (1) significantly higher packet rates, where the per-packet processing overhead compounds, and (2) hardware platforms with lower Python interpreter throughput than the test platform.
+
+The latency uniformity across modes (0.057–0.062 ms average) reflects the dominance of Pass 2, which is the computationally simplest pass: it evaluates the decision layer twice for the override check, then runs a grid of at most 9 × 3 = 27 additional calls for the Layer 2 perturbation. Pass 4 (multi-feature pairs) was not invoked in the real-time benchmark: `cf_realtime.py` imports only `_pass1_search`, `_pass2_search`, and `_pass3_temporal`; Pass 4 is absent from the `LatencyBoundedCFGenerator` call sequence for all four budget modes, including RELAXED and BATCH. The 231 unexplained packets exhausted Passes 1–3 without a successful counterfactual; whether Pass 4 would resolve any of them is an open measurement. In a deployment where Pass 4 is integrated into the real-time path, its O(n²) evaluation budget (75 pair evaluations) would add measurable latency for packets reaching it, and the latency difference between RELAXED/BATCH and STRICT/NORMAL would become observable.
+
+### C. Adaptive Threshold Underutilisation
+
+The adaptive threshold contributed detection for only 81 packets (0.8% of anomalies), compared with 9,597 (99.1%) for hard_override_risk. This result reflects the specific characteristics of Mirai C2 traffic: the risk scores for Mirai C2 packets are consistently high (mean 1.93, substantially above the override threshold of 1.5), so the hard override fires before the adaptive threshold is ever consulted. The adaptive threshold's contribution would be larger in scenarios with subtler anomalies — stealth intrusions, low-rate exfiltration, or encrypted C2 channels — where the risk score may not exceed the hard override threshold.
+
+The practical implication is that operational tuning should distinguish between two traffic regimes: high-confidence, rule-classifiable attacks (where the hard override is the primary detection mechanism and the adaptive threshold adds no value) and ambiguous anomalies (where the adaptive threshold is essential). A deployment strategy that disables the hard override threshold and relies entirely on the adaptive threshold would miss 99.1% of anomalies in this capture — demonstrating that the override mechanism should not be treated as optional even in adaptive systems.
+
+### D. Poisoning Vulnerability (Experiment C)
+
+The Experiment C finding — that a malicious analyst providing sustained adversarial feedback can raise the FN rate to 100% in 10 rounds — is an honest and important limitation of any human-feedback-based adaptive system. The vulnerability arises because the drift detector is designed as a *change* detector: it compares the current FP rate to a baseline established during an assumed-normal early period. If the adversarial feedback begins in Round 1, no clean baseline is established, and the elevated FP rate never triggers the change-detection criterion.
+
+Several mitigations are possible within the existing framework. A global FP rate alarm (triggering when the absolute FP rate exceeds a configured limit, independent of the baseline comparison) would detect the C2/C3 scenario. Multi-analyst consensus requirements — where feedback from a single analyst does not update parameters without independent confirmation — would make coordinated poisoning significantly more difficult. Byzantine-fault-tolerant weight update rules [12] could bound the influence of any single feedback source. These mitigations are noted as directions for future work in Section VII.
+
+### E. Practical Deployment Considerations
+
+The system as implemented makes several deployment assumptions that should be revisited before production use. First, the KitNET training phase (20,000 packets) processes both normal and attack traffic from the same capture, introducing training contamination: KitNET partially learns the Mirai C2 pattern as normal during the grace period, suppressing RMSE scores for early C2 packets. This is mitigated in the current deployment by the high volume of post-training C2 traffic, but a more rigorous deployment would pre-train KitNET on a clean normal traffic capture before exposing it to mixed traffic.
+
+Second, the risk engine multipliers (endpoint weights, jitter threshold, rate threshold) are configured for the Mirai-specific traffic profile. A deployment against different traffic (enterprise vs. IoT, HTTP-dominated vs. UDP-dominated) would require retuning these parameters through empirical profiling. The profile-based architecture (YAML profiles per traffic class) supports this, but no automated profile selection mechanism currently exists.
+
+---
+
+## VI. Limitations
+
+This paper discloses the following limitations, which bound the interpretability of the reported results and constrain their applicability to the research community.
+
+**L1 — Synthetic Ground Truth.** Ground truth labels used in feedback learning experiments were generated from the Kitsune paper's published attack timeline — packet ranges associated with each attack phase — not from per-packet annotation. These labels are appropriate for evaluating the feedback learning algorithm's convergence behaviour and the drift detector's response timing, but they do not constitute validated ground truth for computing precision, recall, or F1 scores as detection performance claims. No detection metrics in this paper should be interpreted as publishable evaluation results against a verified ground truth; they characterise system behaviour on a labelled simulation. Researchers seeking publishable detection metrics should apply the pipeline to per-packet annotated datasets such as the UNSW-NB15 PCAP files [16] or CIC-IDS2017 [17].
+
+**L2 — Training Contamination.** KitNET trains on the first 20,000 packets of *mirai.pcap*, which contains attack traffic beginning before packet 20,000. The autoencoder ensemble partially learns Mirai C2 packet structures as normal during the grace period. This suppresses RMSE scores for early C2 packets and may inflate RMSE for late normal packets. The magnitude of this contamination is not quantified in this work. A contamination-free evaluation would require separate clean-traffic and attack-traffic captures, with KitNET trained exclusively on the former.
+
+**L3 — Single Dataset and Single Attack Family.** All experimental results are derived from a single Mirai IoT botnet capture. Mirai is an atypical attacker in several respects: it generates high-volume, port-specific C2 traffic that is readily classifiable by a Tier 1 rule; it produces consistently high RMSE scores due to its mechanistic, non-adaptive traffic patterns; and it dominates the anomaly distribution (86.0%) to the exclusion of the other attack types present in the capture. Results — particularly the 87.2% Pass 2 dominance and the 99.1% hard_override_risk detection path — are specific to this traffic composition and may not generalise to deployments against more diverse attack families (ransomware, APT, exfiltration, lateral movement).
+
+**L4 — No External Baseline Comparison.** The explainability layer and CF engine have not been compared against established XAI baselines such as LIME [3] or SHAP [4] applied to the same packets. The claim that Pass 2 explanations are more actionable than SHAP attributions for override-locked decisions is architecturally motivated but not empirically validated through a user study or head-to-head comparison. A rigorous evaluation would measure analyst triage time and decision accuracy under each explanation type.
+
+**L5 — Synthetic Feedback Labels.** Feedback learning experiments used synthetically injected false positive labels (FPInjector) rather than real analyst feedback. The 5% label noise rate in most experiments is a conservative approximation of analyst error, but real analyst feedback may exhibit systematic biases, contextual dependencies, or adversarial intent that the synthetic injection does not capture. The poisoning results (Section IV-G) represent the worst case of adversarial intent but do not model intermediate scenarios (e.g., an analyst who is systematically overconfident in one attack category but accurate in others).
+
+---
+
+## VII. Conclusion
+
+This paper presented a context-aware Kitsune IDS pipeline with an integrated four-pass counterfactual explanation engine, a multi-module explainability layer, and a human-feedback learning module. The system was evaluated on 99,999 packets from a Mirai IoT botnet capture, detecting 9,685 anomalies (9.7%) and producing counterfactual explanations for 97.6% of them.
+
+The primary finding — that 87.2% of anomalies require Pass 2 (override decomposition) to receive a meaningful counterfactual explanation — establishes a new design requirement for IDS operating on botnet-class traffic: score-level explanation is structurally insufficient when an attack classification rule, not the anomaly score, determines the enforcement decision. This finding motivates the multi-pass CF architecture as a necessary component of any explainable hybrid NIDS, rather than an optional enhancement.
+
+Secondary findings include: CF generation at a mean latency of 0.06 ms (p95: 0.08 ms) with zero timeouts across all four budget modes, confirming real-time feasibility; FP elimination within one feedback round under analyst feedback pressure; and successful drift detection in three conceptually distinct drift scenarios, with a documented vulnerability to sustained adversarial feedback from Round 1.
+
+The following future work directions are identified as priorities for extending this research:
+
+1. **Real per-packet ground truth.** Apply the pipeline to the full UNSW-NB15 PCAP files or CIC-IDS2017 to compute validated precision, recall, and F1 scores against per-packet annotations.
+
+2. **Multi-family attack evaluation.** Evaluate the CF pass distribution, detection path analysis, and feedback learning convergence on captures containing DoS, reconnaissance, exfiltration, and lateral movement, to establish whether the 87.2% Pass 2 dominance generalises beyond Mirai.
+
+3. **LIME and SHAP baseline comparison.** Conduct a controlled user study comparing analyst triage time and accuracy under CF explanations, LIME attributions, and SHAP attributions for the same set of anomalies, with particular focus on override-locked packets.
+
+4. **Poisoning resistance improvements.** Implement multi-analyst consensus requirements, global FP rate alarms, and Byzantine-fault-tolerant weight update rules to address the coordinated adversarial feedback vulnerability identified in Experiment C.
+
+5. **Live SOC deployment.** Deploy the system in an operational security operations centre environment to measure real analyst engagement rates, feedback latency, and the practical effect of the explanation modules on alert triage time and false positive dismissal accuracy.
+
+---
+
+## References
+
+[1] Ponemon Institute, "The State of Security Operations Centres," Ponemon Institute Research Report, 2022.
+
+[2] R. Sommer and V. Paxson, "Outside the Closed World: On Using Machine Learning for Network Intrusion Detection," *IEEE Symposium on Security and Privacy*, pp. 305–316, 2010.
+
+[3] M. T. Ribeiro, S. Singh, and C. Guestrin, "'Why Should I Trust You?': Explaining the Predictions of Any Classifier," *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD)*, pp. 1135–1144, 2016.
+
+[4] S. M. Lundberg and S.-I. Lee, "A Unified Approach to Interpreting Model Predictions," *Advances in Neural Information Processing Systems (NeurIPS)*, vol. 30, pp. 4765–4774, 2017.
+
+[5] S. Wachter, B. Mittelstadt, and C. Russell, "Counterfactual Explanations without Opening the Black Box: Automated Decisions and the GDPR," *Harvard Journal of Law & Technology*, vol. 31, no. 2, pp. 841–887, 2018.
+
+[6] L. Antwarg, R. M. Miller, L. Rokach, and B. Shapira, "Explaining Anomalies Detected by Autoencoders Using Shapley Additive Explanations," *Expert Systems with Applications*, vol. 186, p. 115736, 2021.
+
+[7] Q. Wang, W. Li, and Y. Huang, "Explainable Intrusion Detection System Using LIME and SHAP: Feature Attribution for NSL-KDD Benchmark," *IEEE Access*, vol. 10, pp. 24598–24612, 2022.
+
+[8] Y. Mirsky, T. Doitshman, Y. Elovici, and A. Shabtai, "Kitsune: An Ensemble of Autoencoders for Online Network Intrusion Detection," *Proceedings of the Network and Distributed System Security Symposium (NDSS)*, 2018.
+
+[9] A. L. Buczak and E. Guven, "A Survey of Data Mining and Machine Learning Methods for Cyber Security Intrusion Detection," *IEEE Communications Surveys & Tutorials*, vol. 18, no. 2, pp. 1153–1176, 2016.
+
+[10] R. K. Mothilal, A. Sharma, and C. Tan, "Explaining Machine Learning Classifiers through Diverse Counterfactual Explanations," *Proceedings of the 2020 Conference on Fairness, Accountability, and Transparency (FAccT)*, pp. 607–617, 2020.
+
+[11] W. Guo, D. Mu, J. Xu, P. Su, G. Wang, and X. Xing, "LEMNA: Explaining Deep Learning Based Security Applications," *Proceedings of the 25th ACM Conference on Computer and Communications Security (CCS)*, pp. 364–379, 2018.
+
+[12] A. Apruzzese, M. Colajanni, L. Ferretti, and M. Marchetti, "Addressing Adversarial Attacks Against Security Systems Based on Machine Learning," *Proceedings of the 11th International Conference on Cyber Conflict (CyCon)*, pp. 1–18, 2019.
+
+[13] A. Bifet and R. Gavalda, "Learning from Time-Changing Data with Adaptive Windowing," *Proceedings of the 2007 SIAM International Conference on Data Mining*, pp. 443–448, 2007.
+
+[14] J. Gama, P. Medas, G. Castillo, and P. Rodrigues, "Learning with Drift Detection," *Proceedings of the 17th Brazilian Symposium on Artificial Intelligence (SBIA)*, pp. 286–295, 2004.
+
+[15] K. Miller, A. H. Bunn, and R. J. Brown, "Active Learning for Network Intrusion Detection: Reducing Labelling Cost in Security Analytics," *Computers & Security*, vol. 97, 2020.
+
+[16] N. Moustafa and J. Slay, "UNSW-NB15: A Comprehensive Data Set for Network Intrusion Detection Systems," *IEEE Military Communications and Information Systems Conference (MilCIS)*, pp. 1–6, 2015.
+
+[17] I. Sharafaldin, A. H. Lashkari, and A. A. Ghorbani, "Toward Generating a New Intrusion Detection Dataset and Intrusion Traffic Characterization," *Proceedings of the 4th International Conference on Information Systems Security and Privacy (ICISSP)*, pp. 108–116, 2018.
+
+[18] N. Littlestone and M. K. Warmuth, "The Weighted Majority Algorithm," *Information and Computation*, vol. 108, no. 2, pp. 212–261, 1994.
+
+[19] C. Molnar, *Interpretable Machine Learning: A Guide for Making Black Box Models Explainable*, 2nd ed., 2022. [Online]. Available: https://christophm.github.io/interpretable-ml-book/
+
+[20] H. C. Karimi, G. Barthe, B. Balle, and I. Valera, "Model-Agnostic Counterfactual Explanations for Consequential Decisions," *Proceedings of the 23rd International Conference on Artificial Intelligence and Statistics (AISTATS)*, pp. 895–905, 2020.
+
+---
+
+*Manuscript received: 2026-05-17. This work is based on an open-source research prototype. Ground truth labels are synthetic (derived from the Kitsune paper attack timeline) and are not suitable for publication as validated detection performance metrics. Code and data are available at the project repository.*

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+
+# Datasets
+*.pcap
+*.pcapng
+*.tsv
+*.zip
+
+# Logs
+*.log
+
+# Results
+results*.csv
+ground_truth.csv
+
+# Temporary files
+*.tmp
+
+# Personal documents
+*.docx
+*.pptx

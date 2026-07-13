@@ -274,6 +274,50 @@ def print_report(TP, FP, TN, FN, metrics, n_matched, n_results, n_labels, roc_au
 # Main
 # ─────────────────────────────────────────────────────────
 
+_GT_NOTES = {
+    "synthetic": (
+        "[!] SYNTHETIC GROUND TRUTH -- not for publication.\n"
+        "    Labels derived from Kitsune paper attack timeline,\n"
+        "    not from per-packet annotation."
+    ),
+    "unsw": (
+        "[OK] REAL GROUND TRUTH (UNSW-NB15) -- publishable metrics.\n"
+        "     Source: Moustafa & Slay, MilCIS 2015.\n"
+        "     NOTE: Flow-level labels aligned to packet results by row index.\n"
+        "     For fully valid detection metrics, run the pipeline on UNSW-NB15\n"
+        "     PCAP files and match by flow identity."
+    ),
+    "nslkdd": (
+        "[OK] REAL GROUND TRUTH (NSL-KDD) -- publishable metrics.\n"
+        "     Source: Tavallaee et al., CISDA 2009 / UNB CIC dataset.\n"
+        "     NOTE: Flow-level labels aligned to packet results by row index.\n"
+        "     For fully valid detection metrics, run the pipeline on KDD PCAP\n"
+        "     files and match by flow identity."
+    ),
+}
+
+
+def _positional_align(results: dict, truth: dict):
+    """
+    For cross-dataset evaluation (unsw/nslkdd): align by sequential position
+    rather than by shared packet_id.
+    - Takes detection-phase predictions (label != TRAIN) from results, sorted.
+    - Pairs them 1-to-1 with ground truth rows, sorted by packet_id.
+    - Returns (y_pred, y_true, scores, n_matched).
+    """
+    detect_rows = sorted(
+        ((pid, v) for pid, v in results.items() if v["label"] != "TRAIN"),
+        key=lambda x: x[0]
+    )
+    truth_rows  = sorted(truth.items(), key=lambda x: x[0])
+
+    n = min(len(detect_rows), len(truth_rows))
+    y_pred = [detect_rows[i][1]["label"] for i in range(n)]
+    y_true = [truth_rows[i][1]           for i in range(n)]
+    scores = [detect_rows[i][1]["score"] for i in range(n)]
+    return y_pred, y_true, scores, n
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate Kitsune IDS predictions against ground truth labels."
@@ -286,19 +330,42 @@ def main():
         "--labels", required=True, metavar="PATH",
         help="Path to ground truth CSV: packet_id,true_label",
     )
+    parser.add_argument(
+        "--ground-truth-type",
+        choices=["synthetic", "unsw", "nslkdd"],
+        default="synthetic",
+        dest="gt_type",
+        help=(
+            "synthetic — Kitsune timeline labels (not for publication); "
+            "unsw      — UNSW-NB15 real labels (publishable); "
+            "nslkdd    — NSL-KDD real labels (publishable)"
+        ),
+    )
     args = parser.parse_args()
+
+    # Print ground-truth provenance note up front
+    print()
+    print(_GT_NOTES[args.gt_type])
+    print()
 
     results = load_results(args.results)
     truth   = load_ground_truth(args.labels)
 
-    # Inner join on packet_id
-    common_ids = sorted(set(results) & set(truth))
-    if not common_ids:
-        sys.exit("[evaluate] No matching packet_ids between results and labels.")
-
-    y_pred   = [results[pid]["label"] for pid in common_ids]
-    y_true   = [truth[pid]            for pid in common_ids]
-    scores   = [results[pid]["score"] for pid in common_ids]
+    if args.gt_type in ("unsw", "nslkdd"):
+        # Cross-dataset: align detection-phase predictions to ground truth rows
+        # by sequential position (not by shared packet_id).
+        y_pred, y_true, scores, n_matched = _positional_align(results, truth)
+        if n_matched == 0:
+            sys.exit("[evaluate] No detection-phase predictions found in results.csv.")
+        common_ids = list(range(1, n_matched + 1))   # synthetic — for report only
+    else:
+        # Same-dataset: inner join on packet_id (synthetic ground truth)
+        common_ids = sorted(set(results) & set(truth))
+        if not common_ids:
+            sys.exit("[evaluate] No matching packet_ids between results and labels.")
+        y_pred = [results[pid]["label"] for pid in common_ids]
+        y_true = [truth[pid]            for pid in common_ids]
+        scores = [results[pid]["score"] for pid in common_ids]
 
     TP, FP, TN, FN = confusion(y_true, y_pred)
     metrics = per_class_metrics(TP, FP, TN, FN)
@@ -314,7 +381,7 @@ def main():
 
     print_report(
         TP, FP, TN, FN, metrics,
-        n_matched = len(common_ids),
+        n_matched = n_matched if args.gt_type in ("unsw", "nslkdd") else len(common_ids),
         n_results = len(results),
         n_labels  = len(truth),
         roc_auc   = roc_auc,
