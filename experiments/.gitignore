@@ -32,3 +32,23 @@ experiments/*.csv
 # OS
 .DS_Store
 Thumbs.db
+# Virtual environment
+Lib/
+Scripts/
+Include/
+*.pyc
+__pycache__/
+
+# Dataset files
+*.csv
+*.pcap
+*.pcapng
+
+# Results
+results/
+*.png
+Lib/
+Scripts/
+Include/
+*.pyc
+__pycache__/
