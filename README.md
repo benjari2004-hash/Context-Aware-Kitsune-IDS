@@ -1,5 +1,5 @@
 # Context-Aware Kitsune IDS
-
+![Architecture](architecture.png)
 Context-Aware Kitsune IDS is a research implementation of an intrusion detection pipeline that extends Kitsune-style online anomaly detection with contextual risk assessment, adaptive decision thresholds, attack classification, and actionable counterfactual explanations.
 
 The project integrates anomaly detection, contextual analysis, adaptive decision making, and explainable AI techniques to improve the interpretability and operational relevance of network intrusion detection systems.
